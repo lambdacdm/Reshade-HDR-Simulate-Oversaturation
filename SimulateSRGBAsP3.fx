@@ -5,20 +5,16 @@
 // (P3)色域直接点亮"这一现象——而不是用通用的 HSV/HSL 饱和度拉伸去近似它。
 //
 // 原理:
-//   1. 从当前 HDR 后台缓冲区(scRGB 或 HDR10 PQ)反推出游戏"本来想输出"的
-//      sRGB 编码值(0-1,类似没开 HDR 时你会看到的那串数字)。
-//   2. 刻意用错误的方式解读这组数值——不当成 sRGB,而是当成 P3 原生 RGB,
-//      按 P3 的原色去混色,得到"面板被错误驱动"后实际发出的颜色。
-//   3. 把这个结果转换回你显示器真正需要的输出格式,正确上屏。
+//   把当前 HDR 画面的颜色转换到 XYZ,然后不经过正确的 sRGB/Rec.709 矩阵,
+//   而是故意用 P3 的原色矩阵重新解读这组数值,得到"面板被错误驱动"后实际
+//   发出的颜色,再转换回显示器真正需要的输出格式。
 //
-// 因为整个过程走的是原色矩阵(顶点坐标)变换,红绿蓝三个通道是联动缩放的,
-// 不会像通用饱和度算法那样因为单通道提前 clip 而在高饱和区域出现色相跑偏
-// (比如黄色偏红)的问题。
+// 这是一个固定的线性矩阵变换,对任意亮度(包括超过纸白的 HDR 高光)一视同仁,
+// 不需要纸白亮度之类的参考点,也不会在高光区域出现裁切或色相跑偏的问题。
+// 因为整个过程走的是原色矩阵变换,红绿蓝三个通道是联动缩放的,不会像通用
+// 饱和度算法那样因为单通道提前 clip 而在高饱和区域出现色相跑偏(比如黄色偏红)。
 //
 // 用法:
-//   - PaperWhiteNits: 填你 Windows HDR 设置里 "SDR 内容亮度 / paper white"
-//     的实际数值(不是显示器峰值,是那个用来定义"什么亮度算作 100% 白"的值)。
-//     这个数值决定了第 1 步"反推原始 sRGB 值"是否准确,建议先精确填对。
 //   - EffectStrength: 0 = 正常/正确颜色,100 = 完全体验"bug"效果,可以按
 //     喜好在中间取值做混合强度调节。
 //
@@ -35,26 +31,18 @@
 
 uniform int ColorSpaceMode <
     ui_type = "combo";
-    ui_label = "色彩空间判断方式";
-    ui_items = "自动(跟随编译时检测)\0强制 HDR10 PQ\0强制 scRGB\0强制关闭(不处理)\0";
-    ui_tooltip = "'自动'依赖 ReShade 编译时告知的 BUFFER_COLOR_SPACE,如果切换 HDR/SDR 后发现效果不再生效(比如滑块没反应),\n不需要重启游戏,直接在这里手动选'强制 HDR10 PQ'或'强制 scRGB'纠正即可——这个下拉框和滑条一样是实时生效的,不需要重新编译。";
-    ui_category = "基础设置";
+    ui_label = "Color Space Mode / 色彩空间判断方式";
+    ui_items = "Auto (compile-time detection)\0Force HDR10 PQ\0Force scRGB\0Force Off\0";
+    ui_tooltip = "'Auto' relies on ReShade's BUFFER_COLOR_SPACE reported at compile time. If you toggle HDR on/off in-game and the effect stops responding to sliders, ReShade likely failed to refresh its color space detection. Manually switch this to 'Force HDR10 PQ' or 'Force scRGB' to fix it -- this takes effect instantly like any other slider, no restart needed.";
+    ui_category = "Settings";
 > = 0;
-
-uniform float PaperWhiteNits <
-    ui_type = "slider";
-    ui_label = "SDR 参考白 / Paper White (nits)";
-    ui_tooltip = "填 Windows HDR 设置里 'SDR 内容亮度' 对应的尼特值。\n不知道具体多少的话,可以用经验公式估算:80 + 4 x 滑块百分比(0~100),\n比如滑块 80% 大约对应 400 尼特。想要精确值可以用 set_sdrwhite 工具直接读取。";
-    ui_min = 40.0; ui_max = 500.0; ui_step = 1.0;
-    ui_category = "基础设置";
-> = 400.0;
 
 uniform float EffectStrength <
     ui_type = "slider";
-    ui_label = "效果强度 / Bug Strength (%)";
-    ui_tooltip = "0 = 正确颜色,100 = 完全模拟 sRGB 数值被当成 P3 原生色域显示的过饱和效果。";
+    ui_label = "Effect Strength (%) / 效果强度";
+    ui_tooltip = "0 = untouched/correct color, 100 = full effect. Blend to taste.";
     ui_min = 0.0; ui_max = 100.0; ui_step = 1.0;
-    ui_category = "基础设置";
+    ui_category = "Settings";
 > = 100.0;
 
 // ---------------------------------------------------------------------------
@@ -117,24 +105,6 @@ float3 PQ_OETF(float3 L) // 线性亮度(相对 10000 nit 归一化) -> 编码�
     return pow(num / den, PQ_m2);
 }
 
-// sRGB 传递函数,同时也拿来当作"面板自身 EOTF"的近似(标准做法,P3 面板
-// 通常也是接近 sRGB/2.2 这类曲线的响应,不是 P3 色域本身自带什么特殊曲线)
-float3 TransferOETF(float3 c)
-{
-    c = saturate(c);
-    float3 lo = c * 12.92;
-    float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-    return (c <= 0.0031308) ? lo : hi;
-}
-
-float3 TransferEOTF(float3 c)
-{
-    c = saturate(c);
-    float3 lo = c / 12.92;
-    float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    return (c <= 0.04045) ? lo : hi;
-}
-
 // ---------------------------------------------------------------------------
 // 主逻辑
 // ---------------------------------------------------------------------------
@@ -168,15 +138,12 @@ float3 PS_SimulateSRGBAsP3(float4 pos : SV_Position, float2 texcoord : TEXCOORD)
     float3 linearNits = isPQ ? (PQ_EOTF(col) * 10000.0) : (col * 80.0);
     float3 XYZ = isPQ ? mul(BT2020_to_XYZ, linearNits) : mul(Rec709_to_XYZ, linearNits);
 
-    // 第一步:还原游戏"本来想输出"的 sRGB 编码值(以 PaperWhite 为参考白)
-    float3 rec709Linear = mul(XYZ_to_Rec709, XYZ) / max(PaperWhiteNits, 1.0);
-    float3 sdrCodeValue = TransferOETF(max(rec709Linear, 0.0));
+    // 这就是那个"bug":不用正确的 Rec.709 矩阵转回去,而是先转到 Rec.709
+    // 线性光,再故意用 P3 的原色矩阵重新混色——对任意亮度一视同仁,不设上限。
+    float3 rec709Linear = mul(XYZ_to_Rec709, XYZ);
+    float3 buggyXYZ = mul(P3D65_to_XYZ, max(rec709Linear, 0.0));
 
-    // 第二步(这就是那个"bug"):把这组数值错误地当成 P3 原生 RGB 去解码混色
-    float3 p3Linear = TransferEOTF(sdrCodeValue);
-    float3 buggyXYZ = mul(P3D65_to_XYZ, p3Linear) * PaperWhiteNits;
-
-    // 第三步:转换回显示器真正需要的输出格式
+    // 转换回显示器真正需要的输出格式
     float3 outNits = isPQ ? mul(XYZ_to_BT2020, buggyXYZ) : mul(XYZ_to_Rec709, buggyXYZ);
     float3 outCode = isPQ ? PQ_OETF(max(outNits, 0.0) / 10000.0) : (outNits / 80.0);
 
@@ -185,7 +152,7 @@ float3 PS_SimulateSRGBAsP3(float4 pos : SV_Position, float2 texcoord : TEXCOORD)
 
 technique SimulateSRGBAsP3
 <
-    ui_tooltip = "故意复现'sRGB 数值被面板当成 P3 原生色域显示'的过饱和效果,基于真实原色矩阵变换而非通用饱和度算法。";
+    ui_tooltip = "Deliberately recreates the look of sRGB values being misread as native P3 by the display, using a real primaries matrix transform instead of a generic saturation algorithm.";
 >
 {
     pass
