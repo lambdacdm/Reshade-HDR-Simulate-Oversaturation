@@ -29,10 +29,18 @@
 
 #include "ReShade.fxh"
 
+#if BUFFER_COLOR_SPACE == 3
+    #define AUTO_MODE_ITEM_LABEL "Auto (detected: HDR10 PQ)\0"
+#elif BUFFER_COLOR_SPACE == 2
+    #define AUTO_MODE_ITEM_LABEL "Auto (detected: scRGB)\0"
+#else
+    #define AUTO_MODE_ITEM_LABEL "Auto (detected: SDR / effect off)\0"
+#endif
+
 uniform int ColorSpaceMode <
     ui_type = "combo";
     ui_label = "Color Space Mode / 色彩空间判断方式";
-    ui_items = "Auto (compile-time detection)\0Force HDR10 PQ\0Force scRGB\0Force Off\0";
+    ui_items = AUTO_MODE_ITEM_LABEL "Force HDR10 PQ\0Force scRGB\0Force Off\0";
     ui_tooltip = "'Auto' relies on ReShade's BUFFER_COLOR_SPACE reported at compile time. If you toggle HDR on/off in-game and the effect stops responding to sliders, ReShade likely failed to refresh its color space detection. Manually switch this to 'Force HDR10 PQ' or 'Force scRGB' to fix it -- this takes effect instantly like any other slider, no restart needed.";
     ui_category = "Settings";
 > = 0;
