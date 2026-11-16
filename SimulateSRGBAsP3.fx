@@ -1,30 +1,51 @@
 // ============================================================================
 // SimulateSRGBAsP3.fx
 //
-// 目的:复现"未做色彩管理时,游戏输出的 sRGB 数值被显示器当成自己的原生
-// (P3)色域直接点亮"这一现象——而不是用通用的 HSV/HSL 饱和度拉伸去近似它。
+// EN: Recreates the look of sRGB content being sent to a wide-gamut (Display P3)
+//     panel WITHOUT color management, using a real primaries matrix instead of
+//     a generic saturation / vibrance boost. For HDR only (scRGB or HDR10 PQ).
 //
-// 原理:
-//   把当前 HDR 画面的颜色转换到 XYZ,然后不经过正确的 sRGB/Rec.709 矩阵,
-//   而是故意用 P3 的原色矩阵重新解读这组数值,得到"面板被错误驱动"后实际
-//   发出的颜色,再转换回显示器真正需要的输出格式。
+// 中文: 复现"未做色彩管理时,sRGB 数值被显示器当成自己的原生 P3 色域直接点亮"
+//     的过饱和效果。用真实的原色矩阵,而不是通用的饱和度/自然饱和度拉伸。
+//     仅在 HDR(scRGB 或 HDR10 PQ)下生效。
 //
-// 这是一个固定的线性矩阵变换,对任意亮度(包括超过纸白的 HDR 高光)一视同仁,
-// 不需要纸白亮度之类的参考点,也不会在高光区域出现裁切或色相跑偏的问题。
-// 因为整个过程走的是原色矩阵变换,红绿蓝三个通道是联动缩放的,不会像通用
-// 饱和度算法那样因为单通道提前 clip 而在高饱和区域出现色相跑偏(比如黄色偏红)。
+// How it works / 原理:
+//   Take the linear light of the image as Rec.709/sRGB values, then re-read the
+//   same three numbers as Display P3 values (the "bug"). Because this is a
+//   fixed linear 3x3 transform, it behaves identically at every brightness
+//   (HDR highlights included), the R/G/B channels scale together (no hue
+//   shift), and neutral colors (black, grays, white) are left untouched.
+//   把画面线性光当作 Rec.709/sRGB 数值,再把同样三个数"误读"为 P3 数值。
+//   这是固定的线性 3x3 变换:任何亮度下行为一致(包括 HDR 高光),
+//   三个通道联动缩放(不会色相偏移),黑、灰、白保持不变。
 //
-// 用法:
-//   - EffectStrength: 0 = 正常/正确颜色,100 = 完全体验"bug"效果,可以按
-//     喜好在中间取值做混合强度调节。
+// Implementation notes / 实现说明:
+//   * The whole chain (container -> Rec.709 -> read as P3 -> container) is
+//     pre-merged into single 3x3 matrices, all derived from the same D65 white
+//     (0.3127, 0.3290). Every matrix row sums to 1, so white stays exactly white.
+//     整条链路已预合并成单个 3x3 矩阵,全部基于同一 D65 白点推导,
+//     每行之和为 1,因此白色保持精确不变。
+//   * Strength blending is done in LINEAR light for both scRGB and PQ, so the
+//     slider means the same thing in both modes.
+//     强度混合在线性光中进行,scRGB 与 PQ 下滑块含义一致。
+//   * No clamping of the input to Rec.709: out-of-gamut (negative) components
+//     from wide-gamut content are processed by the same linear transform
+//     instead of being hard-clipped. Negative values can only be dropped at
+//     the very end when encoding PQ (PQ cannot represent them); scRGB keeps them.
+//     不再把输入硬裁切到 Rec.709;超色域内容走同一线性变换。
+//     只有在编码 PQ 的最后一步才会丢弃负值(PQ 无法表示),scRGB 则保留。
 //
-// 注意:
-//   - BUFFER_COLOR_SPACE 的具体数值(2=scRGB, 3=HDR10 PQ)是 ReShade 近期
-//     版本的通用约定。如果编译报错或者效果方向不对(比如在错误的模式下
-//     生效),可以在 ReShade 内置的预处理器定义/统计信息里确认你当前的
-//     实际 BUFFER_COLOR_SPACE 数值,然后把下面 #if 里的数字改成对应的值。
-//   - 这版假设你的游戏内容本来就是按 Rec.709/sRGB 色域制作的(绝大多数
-//     游戏都是),如果是原生宽色域渲染的游戏,效果会不准确。
+// Notes / 注意:
+//   * Assumes the game content is authored for Rec.709/sRGB (true for the vast
+//     majority of games). Natively wide-gamut content will look over-saturated.
+//     假设游戏内容按 Rec.709/sRGB 制作(绝大多数游戏如此)。
+//   * BUFFER_COLOR_SPACE: 2 = scRGB, 3 = HDR10 PQ. HDR10 HLG (4) is not
+//     supported and is treated as "off".
+//     BUFFER_COLOR_SPACE:2 = scRGB,3 = HDR10 PQ;HLG(4)不支持,视为关闭。
+//   * Place this effect at the TOP of your effect list, above other color
+//     shaders. / 请把本效果放在效果列表最上方。
+//
+// License: MIT
 // ============================================================================
 
 #include "ReShade.fxh"
@@ -41,54 +62,51 @@ uniform int ColorSpaceMode <
     ui_type = "combo";
     ui_label = "Color Space Mode / 色彩空间判断方式";
     ui_items = AUTO_MODE_ITEM_LABEL "Force HDR10 PQ\0Force scRGB\0Force Off\0";
-    ui_tooltip = "'Auto' relies on ReShade's BUFFER_COLOR_SPACE reported at compile time. If you toggle HDR on/off in-game and the effect stops responding to sliders, ReShade likely failed to refresh its color space detection. Manually switch this to 'Force HDR10 PQ' or 'Force scRGB' to fix it -- this takes effect instantly like any other slider, no restart needed.";
+    ui_tooltip = "'Auto' relies on ReShade's BUFFER_COLOR_SPACE reported at compile time. If you toggle HDR on/off in-game and the effect stops responding to sliders, ReShade likely failed to refresh its color space detection. Manually switch this to 'Force HDR10 PQ' or 'Force scRGB' to fix it -- this takes effect instantly, no restart needed.\n\nWarning: forcing the wrong mode will make the image look broken. Switch back to Auto or pick the correct mode to recover.";
     ui_category = "Settings";
 > = 0;
 
 uniform float EffectStrength <
     ui_type = "slider";
     ui_label = "Effect Strength (%) / 效果强度";
-    ui_tooltip = "0 = untouched/correct color, 100 = full effect. Blend to taste.";
+    ui_tooltip = "0 = untouched/correct color, 100 = full effect. Blended in linear light, identical behavior in scRGB and HDR10 PQ.";
     ui_min = 0.0; ui_max = 100.0; ui_step = 1.0;
     ui_category = "Settings";
 > = 100.0;
 
 // ---------------------------------------------------------------------------
-// 标准原色矩阵 (D65 白点,行主序,M * vec = 结果)
+// Pre-merged primaries matrices (D65 white x=0.3127, y=0.3290).
+// Row-major; used as mul(M, v). Every row sums to 1 (white is preserved).
+// 预合并的原色矩阵(D65 白点),行主序,mul(M, v);每行之和为 1。
 // ---------------------------------------------------------------------------
 
-static const float3x3 Rec709_to_XYZ = float3x3(
-    0.4124564, 0.3575761, 0.1804375,
-    0.2126729, 0.7151522, 0.0721750,
-    0.0193339, 0.1191920, 0.9503041
+// HDR10 container (BT.2020 linear) -> Rec.709 linear
+static const float3x3 BT2020_to_Rec709 = float3x3(
+     1.6604910, -0.5876411, -0.0728499,
+    -0.1245505,  1.1328999, -0.0083494,
+    -0.0181508, -0.1005789,  1.1187297
 );
 
-static const float3x3 XYZ_to_Rec709 = float3x3(
-     3.2404542, -1.5371385, -0.4985314,
-    -0.9692660,  1.8760108,  0.0415560,
-     0.0556434, -0.2040259,  1.0572252
+// "The bug" for scRGB: Rec.709 values re-read as P3, expressed in Rec.709.
+// Blue column is zero because sRGB and P3 share the same blue primary.
+// scRGB 下的"误读":Rec.709 数值按 P3 解读,再表示回 Rec.709。
+// sRGB 与 P3 蓝原色相同,所以最后一列前两项为 0。
+static const float3x3 P3D65_to_Rec709 = float3x3(
+     1.2249402, -0.2249402,  0.0000000,
+    -0.0420570,  1.0420570,  0.0000000,
+    -0.0196376, -0.0786360,  1.0982736
 );
 
-static const float3x3 P3D65_to_XYZ = float3x3(
-    0.4865709, 0.2656677, 0.1982173,
-    0.2289746, 0.6917385, 0.0792869,
-    0.0000000, 0.0451134, 1.0439444
-);
-
-static const float3x3 XYZ_to_BT2020 = float3x3(
-     1.7166512, -0.3556708, -0.2533663,
-    -0.6666844,  1.6164812,  0.0157685,
-     0.0176399, -0.0427706,  0.9421031
-);
-
-static const float3x3 BT2020_to_XYZ = float3x3(
-    0.6369580, 0.1446169, 0.1688810,
-    0.2627002, 0.6779981, 0.0593017,
-    0.0000000, 0.0280727, 1.0609851
+// "The bug" for HDR10: P3 primaries expressed in BT.2020 container.
+// HDR10 下的"误读":P3 原色表示回 BT.2020 容器。
+static const float3x3 P3D65_to_BT2020 = float3x3(
+     0.7538330,  0.1985974,  0.0475696,
+     0.0457438,  0.9417772,  0.0124789,
+    -0.0012103,  0.0176017,  0.9836086
 );
 
 // ---------------------------------------------------------------------------
-// ST.2084 (PQ) 编解码
+// ST.2084 (PQ) transfer functions
 // ---------------------------------------------------------------------------
 
 static const float PQ_m1 = 0.1593017578125;
@@ -97,7 +115,8 @@ static const float PQ_c1 = 0.8359375;
 static const float PQ_c2 = 18.8515625;
 static const float PQ_c3 = 18.6875;
 
-float3 PQ_EOTF(float3 E) // 编码值[0,1] -> 线性亮度(相对 10000 nit 归一化)
+// Encoded [0,1] -> linear light (normalized, 1.0 = 10000 nits)
+float3 PQ_EOTF(float3 E)
 {
     float3 Ep  = pow(max(E, 0.0), 1.0 / PQ_m2);
     float3 num = max(Ep - PQ_c1, 0.0);
@@ -105,7 +124,8 @@ float3 PQ_EOTF(float3 E) // 编码值[0,1] -> 线性亮度(相对 10000 nit 归�
     return pow(num / max(den, 1e-6), 1.0 / PQ_m1);
 }
 
-float3 PQ_OETF(float3 L) // 线性亮度(相对 10000 nit 归一化) -> 编码值[0,1]
+// Linear light (normalized, 1.0 = 10000 nits) -> encoded [0,1]
+float3 PQ_OETF(float3 L)
 {
     float3 Lm  = pow(max(L, 0.0), PQ_m1);
     float3 num = PQ_c1 + PQ_c2 * Lm;
@@ -114,17 +134,15 @@ float3 PQ_OETF(float3 L) // 线性亮度(相对 10000 nit 归一化) -> 编码�
 }
 
 // ---------------------------------------------------------------------------
-// 主逻辑
+// Main
 // ---------------------------------------------------------------------------
 
 float3 PS_SimulateSRGBAsP3(float4 pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
     float3 col = tex2D(ReShade::BackBuffer, texcoord).rgb;
 
-    // 决定本次实际使用哪种格式处理:
-    // mode 0 = 自动(用编译时的 BUFFER_COLOR_SPACE 作初始猜测,仅在切换 HDR 后
-    //           ReShade 没能正确重新编译时才可能不准,此时手动选下面两项之一即可)
-    // mode 1 = 强制 HDR10 PQ   mode 2 = 强制 scRGB   mode 3 = 强制关闭
+    // mode 0 = Auto (compile-time BUFFER_COLOR_SPACE as initial guess)
+    // mode 1 = Force HDR10 PQ, 2 = Force scRGB, 3 = Force Off
     int mode = ColorSpaceMode;
     if (mode == 0)
     {
@@ -137,25 +155,26 @@ float3 PS_SimulateSRGBAsP3(float4 pos : SV_Position, float2 texcoord : TEXCOORD)
         #endif
     }
 
-    if (mode == 3) return col;
+    float t = saturate(EffectStrength / 100.0);
+    if (mode == 3 || t <= 0.0) return col;
 
     bool isPQ = (mode == 1);
 
-    // ---- 以下是运行时分支,不依赖重新编译,HDR/SDR 切换后立刻按当前 mode 生效 ----
+    // Linear light in the container's own primaries.
+    // scRGB: already linear Rec.709. PQ: linear BT.2020.
+    // (Matrices are linear, so the absolute nit scale does not matter.)
+    float3 linearIn = isPQ ? PQ_EOTF(col) : col;
 
-    float3 linearNits = isPQ ? (PQ_EOTF(col) * 10000.0) : (col * 80.0);
-    float3 XYZ = isPQ ? mul(BT2020_to_XYZ, linearNits) : mul(Rec709_to_XYZ, linearNits);
+    // Bring to Rec.709 linear (identity for scRGB), then apply "the bug".
+    float3 rec709Lin = isPQ ? mul(BT2020_to_Rec709, linearIn) : linearIn;
+    float3 linearOut = isPQ ? mul(P3D65_to_BT2020, rec709Lin)
+                            : mul(P3D65_to_Rec709, rec709Lin);
 
-    // 这就是那个"bug":不用正确的 Rec.709 矩阵转回去,而是先转到 Rec.709
-    // 线性光,再故意用 P3 的原色矩阵重新混色——对任意亮度一视同仁,不设上限。
-    float3 rec709Linear = mul(XYZ_to_Rec709, XYZ);
-    float3 buggyXYZ = mul(P3D65_to_XYZ, max(rec709Linear, 0.0));
+    // Blend in linear light (same meaning of the slider in both modes).
+    float3 blended = lerp(linearIn, linearOut, t);
 
-    // 转换回显示器真正需要的输出格式
-    float3 outNits = isPQ ? mul(XYZ_to_BT2020, buggyXYZ) : mul(XYZ_to_Rec709, buggyXYZ);
-    float3 outCode = isPQ ? PQ_OETF(max(outNits, 0.0) / 10000.0) : (outNits / 80.0);
-
-    return lerp(col, outCode, EffectStrength / 100.0);
+    // PQ cannot encode negative values; scRGB can, so keep them there.
+    return isPQ ? PQ_OETF(max(blended, 0.0)) : blended;
 }
 
 technique SimulateSRGBAsP3
